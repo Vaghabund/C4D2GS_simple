@@ -1,0 +1,641 @@
+# -*- coding: utf-8 -*-
+"""
+C4D2GS Simple — Cinema 4D to Gaussian Splat
+=================================================================
+
+A simple Python script for Cinema 4D that generates synthetic COLMAP data.
+
+Usage:
+------
+1. Open Cinema 4D and select the object you want to splat
+2. Edit the SETTINGS section below to customize
+3. Run this script: Plugins > Run Python Script !make sure the target object is selected!
+4. Render the animation to produce the image sequence
+5. Import the synthetic COLMAP data folder into your GS pipeline 
+
+License: CC BY-NC 4.0
+Author: Joel Tenenberg
+"""
+
+import c4d
+import math
+import json
+import os
+import random
+import bisect
+
+# ===========================================================================
+# SETTINGS — Edit these values before running
+# ===========================================================================
+
+# Camera rig setup
+CAMERA_COUNT = 120              # Number of viewpoints around the object
+SPHERE_RADIUS = 300.0           # Distance from object center to each camera
+
+# Render output
+OUTPUT_PATH = r"C:\temp\gs_capture\gs_####"  # #### gets replaced by frame number
+RESOLUTION_X = 1920
+RESOLUTION_Y = 1080
+FPS = 30
+
+# Exports
+EXPORT_CAMERA_POSES_JSON = True       # Exports camera_poses.json (for nerfstudio)
+EXPORT_COLMAP_DATA = True             # Exports synthetic COLMAP data files
+
+# Sparse point cloud
+SPARSE_POINT_COUNT = 256        # Number of 3D points sampled from object surface
+REPLACE_EXISTING_RIG = True     # Remove old GS_CameraRig before building new one
+
+# ===========================================================================
+# CORE FUNCTIONS
+# ===========================================================================
+
+def normalize_vec(v):
+    """Normalize a vector."""
+    length = math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z)
+    if length <= 0.0:
+        return c4d.Vector(0, 1, 0)
+    return c4d.Vector(v.x / length, v.y / length, v.z / length)
+
+
+def cross(a, b):
+    """Cross product of two vectors."""
+    return c4d.Vector(
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x,
+    )
+
+
+def dot(a, b):
+    """Dot product of two vectors."""
+    return a.x * b.x + a.y * b.y + a.z * b.z
+
+
+def look_at_matrix(camera_pos, target_pos, up_hint=None):
+    """Build a camera-to-world matrix looking at target_pos."""
+    if up_hint is None:
+        up_hint = c4d.Vector(0, 1, 0)
+    
+    z_axis = normalize_vec(camera_pos - target_pos)
+    if abs(dot(z_axis, up_hint)) > 0.999:
+        up_hint = c4d.Vector(0, 0, 1)
+    
+    x_axis = normalize_vec(cross(up_hint, z_axis))
+    y_axis = normalize_vec(cross(z_axis, x_axis))
+    
+    mg = c4d.Matrix()
+    mg.off = camera_pos
+    mg.v1 = x_axis
+    mg.v2 = y_axis
+    mg.v3 = z_axis
+    return mg
+
+
+def fibonacci_sphere_points(count):
+    """Generate points on a sphere using golden-angle Fibonacci sphere."""
+    if count <= 0:
+        return []
+    
+    points = []
+    golden_angle = math.pi * (3.0 - math.sqrt(5.0))
+    
+    for i in range(count):
+        y = 1.0 - (2.0 * i) / float(max(1, count - 1))
+        radius = math.sqrt(max(0.0, 1.0 - y * y))
+        theta = golden_angle * i
+        points.append(c4d.Vector(math.sin(theta) * radius, y, math.cos(theta) * radius))
+    
+    return points
+
+
+def get_object_center(obj):
+    """Get world-space center of an object."""
+    if obj is None:
+        return c4d.Vector(0)
+    return obj.GetMg().off + obj.GetMp()
+
+
+def matrix_to_rows(mg):
+    """Convert Cinema 4D matrix to 4x4 row-major format."""
+    return [
+        [mg.v1.x, mg.v2.x, mg.v3.x, mg.off.x],
+        [mg.v1.y, mg.v2.y, mg.v3.y, mg.off.y],
+        [mg.v1.z, mg.v2.z, mg.v3.z, mg.off.z],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+
+
+def rotation_matrix_to_quaternion(r):
+    """Convert 3x3 rotation matrix to quaternion (qw, qx, qy, qz)."""
+    trace = r[0][0] + r[1][1] + r[2][2]
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        return 0.25 * s, (r[2][1] - r[1][2]) / s, (r[0][2] - r[2][0]) / s, (r[1][0] - r[0][1]) / s
+    elif (r[0][0] > r[1][1]) and (r[0][0] > r[2][2]):
+        s = math.sqrt(1.0 + r[0][0] - r[1][1] - r[2][2]) * 2.0
+        return (r[2][1] - r[1][2]) / s, 0.25 * s, (r[0][1] + r[1][0]) / s, (r[0][2] + r[2][0]) / s
+    elif r[1][1] > r[2][2]:
+        s = math.sqrt(1.0 + r[1][1] - r[0][0] - r[2][2]) * 2.0
+        return (r[0][2] - r[2][0]) / s, (r[0][1] + r[1][0]) / s, 0.25 * s, (r[1][2] + r[2][1]) / s
+    else:
+        s = math.sqrt(1.0 + r[2][2] - r[0][0] - r[1][1]) * 2.0
+        return (r[1][0] - r[0][1]) / s, (r[0][2] + r[2][0]) / s, (r[1][2] + r[2][1]) / s, 0.25 * s
+
+
+def c2w_to_colmap_extrinsics(mg):
+    """Convert C4D camera-to-world matrix to COLMAP extrinsics (quat, translation, rotation)."""
+    c = mg.off
+    xw = mg.v1
+    yw = mg.v2
+    zw = mg.v3
+    
+    # C4D: +X right, +Y up, +Z back
+    # COLMAP: +X right, +Y down, +Z forward
+    # Apply S = diag(1, -1, -1) to camera rows
+    r_w2c = [
+        [ xw.x,  xw.y,  xw.z],
+        [-yw.x, -yw.y, -yw.z],
+        [-zw.x, -zw.y, -zw.z],
+    ]
+    
+    qw, qx, qy, qz = rotation_matrix_to_quaternion(r_w2c)
+    tx = -(r_w2c[0][0] * c.x + r_w2c[0][1] * c.y + r_w2c[0][2] * c.z)
+    ty = -(r_w2c[1][0] * c.x + r_w2c[1][1] * c.y + r_w2c[1][2] * c.z)
+    tz = -(r_w2c[2][0] * c.x + r_w2c[2][1] * c.y + r_w2c[2][2] * c.z)
+    
+    return (qw, qx, qy, qz), (tx, ty, tz), r_w2c
+
+
+def project_to_image(mg, world_point, fx, fy, cx, cy):
+    """Project a world point into image space using camera matrix."""
+    local = (~mg) * world_point
+    if local.z >= -1e-6:
+        return None
+    
+    depth = -local.z
+    u = (fx * (local.x / depth)) + cx
+    v = (fy * (-local.y / depth)) + cy
+    return u, v
+
+
+def collect_triangles_from_object(obj):
+    """Collect all triangles from an object (including caches/deformers)."""
+    triangles = []
+    
+    def walk_hierarchy(node):
+        if node is None:
+            return
+        if node.CheckType(c4d.Opolygon):
+            mg = node.GetMg()
+            points = node.GetAllPoints()
+            if points:
+                world_pts = [p * mg for p in points]
+                for poly in node.GetAllPolygons():
+                    a, b, c = world_pts[poly.a], world_pts[poly.b], world_pts[poly.c]
+                    triangles.append((a, b, c))
+                    if poly.c != poly.d:
+                        d = world_pts[poly.d]
+                        triangles.append((a, c, d))
+        
+        # Walk children
+        child = node.GetDown()
+        while child:
+            walk_hierarchy(child)
+            child = child.GetNext()
+    
+    # Check main object
+    walk_hierarchy(obj)
+    
+    # Check deform/render caches
+    for cache_source in [obj.GetDeformCache(), obj.GetCache()]:
+        if cache_source:
+            walk_hierarchy(cache_source)
+    
+    return triangles
+
+
+def triangle_area(a, b, c):
+    """Calculate area of a triangle."""
+    return (cross(b - a, c - a).GetLength()) * 0.5
+
+
+def sample_on_triangle(a, b, c):
+    """Uniform random sample on triangle surface."""
+    r1 = math.sqrt(random.random())
+    r2 = random.random()
+    return a * (1.0 - r1) + b * (r1 * (1.0 - r2)) + c * (r1 * r2)
+
+
+def generate_sparse_points_from_surface(obj, count=256):
+    """Generate sparse points by area-weighted sampling from object surface."""
+    triangles = collect_triangles_from_object(obj)
+    if not triangles:
+        return None
+    
+    # Build area-weighted distribution
+    areas = []
+    cumulative = []
+    running = 0.0
+    
+    for tri in triangles:
+        ar = triangle_area(tri[0], tri[1], tri[2])
+        if ar <= 1e-12:
+            continue
+        areas.append((tri, ar))
+        running += ar
+        cumulative.append(running)
+    
+    if running <= 0.0 or not areas:
+        return None
+    
+    # Sample points
+    out = []
+    for _ in range(count):
+        r = random.random() * running
+        idx = bisect.bisect_left(cumulative, r)
+        if idx >= len(areas):
+            idx = len(areas) - 1
+        tri = areas[idx][0]
+        out.append(sample_on_triangle(tri[0], tri[1], tri[2]))
+    
+    return out
+
+
+def get_output_extension():
+    """Output extension is fixed to PNG."""
+    return ".png"
+
+
+def build_frame_image_path(frame_index):
+    """Build output path for a single frame."""
+    token = "{:04d}".format(frame_index)
+    base = OUTPUT_PATH.replace("####", token) if "####" in OUTPUT_PATH else "{}_{}".format(OUTPUT_PATH, token)
+    ext = get_output_extension()
+    return base if base.lower().endswith(ext.lower()) else base + ext
+
+
+def get_render_output_dir():
+    """Get base render output directory."""
+    path = str(OUTPUT_PATH).strip()
+    if not path:
+        return os.path.expanduser("~/Documents/gs_capture")
+    if os.path.isdir(path):
+        return path
+    return os.path.dirname(path)
+
+
+def get_colmap_intrinsics(render_cam):
+    """Get COLMAP intrinsics from render camera only."""
+    focus_pid = getattr(c4d, "CAMERA_FOCUS", None)
+    aperture_pid = getattr(c4d, "CAMERAOBJECT_APERTURE", None)
+
+    if render_cam is None:
+        raise ValueError("Render camera is required to read intrinsics.")
+    if not focus_pid or not aperture_pid:
+        raise ValueError("Cinema 4D camera intrinsics identifiers are unavailable.")
+
+    focal_mm = float(render_cam[focus_pid])
+    aperture_w_mm = float(render_cam[aperture_pid])
+    if focal_mm <= 0 or aperture_w_mm <= 0:
+        raise ValueError("Invalid camera intrinsics: focal length and aperture must be > 0.")
+    if RESOLUTION_X <= 0 or RESOLUTION_Y <= 0:
+        raise ValueError("Invalid resolution for intrinsics computation.")
+
+    aperture_h_mm = aperture_w_mm * (float(RESOLUTION_Y) / float(RESOLUTION_X))
+    fx = (focal_mm / aperture_w_mm) * float(RESOLUTION_X)
+    fy = (focal_mm / aperture_h_mm) * float(RESOLUTION_Y)
+    return {
+        "fx": fx,
+        "fy": fy,
+        "cx": RESOLUTION_X * 0.5,
+        "cy": RESOLUTION_Y * 0.5,
+        "source": "render_camera",
+    }
+
+
+def write_colmap_files(world_points, target_pos, output_dir, render_cam, doc, target_obj):
+    """Export synthetic COLMAP data files (cameras.txt, images.txt, points3D.txt)."""
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    cameras_txt = os.path.join(output_dir, "cameras.txt")
+    images_txt = os.path.join(output_dir, "images.txt")
+    points3d_txt = os.path.join(output_dir, "points3D.txt")
+    
+    intrinsics = get_colmap_intrinsics(render_cam)
+    fx = float(intrinsics["fx"])
+    fy = float(intrinsics["fy"])
+    cx = float(intrinsics["cx"])
+    cy = float(intrinsics["cy"])
+    
+    # Write cameras.txt
+    with open(cameras_txt, "w") as f:
+        f.write("# Camera list\n")
+        f.write("# CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
+        f.write("# Number of cameras: 1\n")
+        f.write("1 PINHOLE {} {} {} {} {} {}\n".format(
+            int(RESOLUTION_X), int(RESOLUTION_Y), fx, fy, cx, cy
+        ))
+    
+    # Generate sparse points from surface
+    sparse_points = generate_sparse_points_from_surface(target_obj, SPARSE_POINT_COUNT)
+    if not sparse_points:
+        raise ValueError("Could not sample sparse points from object surface. Ensure object has polygon geometry.")
+    
+    # Build image entries and track observations
+    image_entries = []
+    for i, world_pos in enumerate(world_points):
+        mg = look_at_matrix(world_pos, target_pos)
+        q, t, r_w2c = c2w_to_colmap_extrinsics(mg)
+        
+        image_entries.append({
+            "image_id": i + 1,
+            "name": os.path.basename(build_frame_image_path(i)),
+            "q": q,
+            "t": t,
+            "r_w2c": r_w2c,
+            "mg": mg,
+            "obs": [],
+        })
+    
+    tracks_by_pid = {}
+    for pid, p3d in enumerate(sparse_points, start=1):
+        tracks_by_pid[pid] = []
+        for entry in image_entries:
+            proj = project_to_image(entry["mg"], p3d, fx, fy, cx, cy)
+            if proj is None:
+                continue
+            u, v = proj
+            if 0 <= u < RESOLUTION_X and 0 <= v < RESOLUTION_Y:
+                pt_idx = len(entry["obs"])
+                entry["obs"].append((u, v, pid))
+                tracks_by_pid[pid].append((entry["image_id"], pt_idx))
+    
+    # Write images.txt
+    with open(images_txt, "w") as f:
+        f.write("# Image list\n")
+        f.write("# IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
+        f.write("# POINTS2D[] as (X, Y, POINT3D_ID)\n")
+        f.write("# Number of images: {}\n".format(len(world_points)))
+        
+        for entry in image_entries:
+            f.write("{} {} {} {} {} {} {} {} 1 {}\n".format(
+                entry["image_id"],
+                entry["q"][0], entry["q"][1], entry["q"][2], entry["q"][3],
+                entry["t"][0], entry["t"][1], entry["t"][2],
+                entry["name"],
+            ))
+            if entry["obs"]:
+                f.write(" ".join("{} {} {}".format(o[0], o[1], o[2]) for o in entry["obs"]) + "\n")
+            else:
+                f.write("\n")
+    
+    # Filter to valid points (at least 1 observation)
+    valid_points = []
+    for pid, p3d in enumerate(sparse_points, start=1):
+        track = tracks_by_pid.get(pid, [])
+        if len(track) >= 1:
+            valid_points.append((pid, p3d, track))
+    
+    if not valid_points:
+        raise ValueError("No sparse points with observations. Try more cameras or more sparse points.")
+    
+    # Write points3D.txt
+    with open(points3d_txt, "w") as f:
+        f.write("# 3D point list\n")
+        f.write("# POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[]\n")
+        f.write("# Number of points: {}\n".format(len(valid_points)))
+        
+        for pid, p3d, track in valid_points:
+            track_flat = " ".join("{} {}".format(img_id, p2d_idx) for img_id, p2d_idx in track)
+            f.write("{} {} {} {} 255 255 255 1.0 {}\n".format(
+                pid, p3d.x, p3d.y, -p3d.z, track_flat
+            ))
+    
+    return {
+        "dir": output_dir,
+        "intrinsics_source": intrinsics["source"],
+        "points": len(valid_points),
+    }
+
+
+def write_pose_json(world_points, target_pos, output_path, render_cam):
+    """Export camera poses as JSON (for nerfstudio/instant-ngp)."""
+    intrinsics = get_colmap_intrinsics(render_cam)
+    fx = float(intrinsics["fx"])
+    fy = float(intrinsics["fy"])
+    cx = float(intrinsics["cx"])
+    cy = float(intrinsics["cy"])
+    
+    frames = []
+    for i, world_pos in enumerate(world_points):
+        mg = look_at_matrix(world_pos, target_pos)
+        hpb = c4d.utils.MatrixToHPB(mg)
+        
+        frames.append({
+            "frame": i,
+            "position": [world_pos.x, world_pos.y, world_pos.z],
+            "rotation_hpb_rad": [hpb.x, hpb.y, hpb.z],
+            "transform_matrix": matrix_to_rows(mg),
+            "fx": fx,
+            "fy": fy,
+            "cx": cx,
+            "cy": cy,
+        })
+    
+    payload = {
+        "coordinate_system": "Cinema4D_Yup_RightHanded",
+        "camera_model": "PINHOLE",
+        "fx": fx,
+        "fy": fy,
+        "cx": cx,
+        "cy": cy,
+        "width": RESOLUTION_X,
+        "height": RESOLUTION_Y,
+        "frame_count": len(world_points),
+        "frames": frames,
+    }
+    
+    out_dir = os.path.dirname(output_path)
+    if out_dir and not os.path.exists(out_dir):
+        os.makedirs(out_dir)
+    
+    with open(output_path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+
+def find_object_by_name(root, name):
+    """Find object by name in hierarchy."""
+    obj = root
+    while obj:
+        if obj.GetName() == name:
+            return obj
+        child = obj.GetDown()
+        if child:
+            found = find_object_by_name(child, name)
+            if found:
+                return found
+        obj = obj.GetNext()
+    return None
+
+
+def create_target_tag(cam, target):
+    """Add target tag to camera pointing at target object."""
+    tag = c4d.BaseTag(c4d.Ttargetexpression)
+    if tag:
+        tag[c4d.TARGETEXPRESSIONTAG_LINK] = target
+        cam.InsertTag(tag)
+
+
+def add_position_key(cam, time, pos, fps):
+    """Add position keyframe to camera."""
+    for axis_idx, axis_val in enumerate([pos.x, pos.y, pos.z]):
+        if axis_idx == 0:
+            did = c4d.DescID(
+                c4d.DescLevel(c4d.ID_BASEOBJECT_REL_POSITION, c4d.DTYPE_VECTOR, 0),
+                c4d.DescLevel(c4d.VECTOR_X, c4d.DTYPE_REAL, 0),
+            )
+        elif axis_idx == 1:
+            did = c4d.DescID(
+                c4d.DescLevel(c4d.ID_BASEOBJECT_REL_POSITION, c4d.DTYPE_VECTOR, 0),
+                c4d.DescLevel(c4d.VECTOR_Y, c4d.DTYPE_REAL, 0),
+            )
+        else:
+            did = c4d.DescID(
+                c4d.DescLevel(c4d.ID_BASEOBJECT_REL_POSITION, c4d.DTYPE_VECTOR, 0),
+                c4d.DescLevel(c4d.VECTOR_Z, c4d.DTYPE_REAL, 0),
+            )
+        
+        track = cam.FindCTrack(did)
+        if not track:
+            track = c4d.CTrack(cam, did)
+            cam.InsertTrackSorted(track)
+        
+        curve = track.GetCurve()
+        key_data = curve.AddKey(time)
+        if key_data:
+            key = key_data["key"]
+            key.SetValue(curve, float(axis_val))
+            key.SetInterpolation(curve, c4d.CINTERPOLATION_STEP)
+
+
+# ===========================================================================
+# MAIN FUNCTION
+# ===========================================================================
+
+def main():
+    doc = c4d.documents.GetActiveDocument()
+    if not doc:
+        c4d.gui.MessageDialog("No active Cinema 4D document.")
+        return
+    
+    target_obj = doc.GetActiveObject()
+    if not target_obj:
+        c4d.gui.MessageDialog("Select an object in the Object Manager.")
+        return
+    
+    # Calculate target position
+    target_pos = get_object_center(target_obj)
+    
+    # Generate camera positions
+    unit_points = fibonacci_sphere_points(CAMERA_COUNT)
+    world_points = [target_pos + p * SPHERE_RADIUS for p in unit_points]
+    
+    doc.StartUndo()
+    try:
+        # Remove old rig if requested
+        if REPLACE_EXISTING_RIG:
+            old_rig = find_object_by_name(doc.GetFirstObject(), "GS_CameraRig")
+            if old_rig:
+                doc.AddUndo(c4d.UNDOTYPE_DELETEOBJ, old_rig)
+                old_rig.Remove()
+        
+        # Create rig null
+        rig = c4d.BaseObject(c4d.Onull)
+        rig.SetName("GS_CameraRig")
+        rig.SetAbsPos(target_pos)
+        doc.InsertObject(rig)
+        doc.AddUndo(c4d.UNDOTYPE_NEWOBJ, rig)
+        
+        # Create target null
+        target_null = c4d.BaseObject(c4d.Onull)
+        target_null.SetName("GS_Target")
+        target_null.InsertUnder(rig)
+        target_null.SetAbsPos(target_pos)
+        doc.AddUndo(c4d.UNDOTYPE_NEWOBJ, target_null)
+        
+        # Create static reference cameras
+        for i, world_pos in enumerate(world_points):
+            cam = c4d.BaseObject(c4d.Ocamera)
+            cam.SetName("GS_Cam_{:04d}".format(i))
+            cam.InsertUnder(rig)
+            cam.SetAbsPos(world_pos)
+            create_target_tag(cam, target_null)
+            doc.AddUndo(c4d.UNDOTYPE_NEWOBJ, cam)
+        
+        # Create animated render camera
+        render_cam = c4d.BaseObject(c4d.Ocamera)
+        render_cam.SetName("GS_RenderCam")
+        render_cam.InsertUnder(rig)
+        render_cam.SetAbsPos(world_points[0])
+        create_target_tag(render_cam, target_null)
+        doc.AddUndo(c4d.UNDOTYPE_NEWOBJ, render_cam)
+        
+        # Keyframe position
+        for frame, world_pos in enumerate(world_points):
+            local_pos = world_pos - target_pos
+            t = c4d.BaseTime(frame, FPS)
+            add_position_key(render_cam, t, local_pos, FPS)
+        
+        # Configure render settings
+        rd = doc.GetActiveRenderData()
+        if rd:
+            rd[c4d.RDATA_XRES] = RESOLUTION_X
+            rd[c4d.RDATA_YRES] = RESOLUTION_Y
+            rd[c4d.RDATA_FRAMERATE] = FPS
+            rd[c4d.RDATA_SAVEIMAGE] = True
+            rd[c4d.RDATA_PATH] = OUTPUT_PATH
+            rd[c4d.RDATA_FORMAT] = c4d.FILTER_PNG
+            rd[c4d.RDATA_FRAMESEQUENCE] = c4d.RDATA_FRAMESEQUENCE_ALLFRAMES
+            rd[c4d.RDATA_FRAMEFROM] = c4d.BaseTime(0, FPS)
+            rd[c4d.RDATA_FRAMETO] = c4d.BaseTime(len(world_points) - 1, FPS)
+            
+            if hasattr(c4d, "RDATA_CAMERA"):
+                rd[c4d.RDATA_CAMERA] = render_cam
+        
+        doc.SetTime(c4d.BaseTime(0, FPS))
+        c4d.EventAdd()
+        
+        # Export files
+        export_status = []
+        
+        if EXPORT_COLMAP_DATA:
+            try:
+                colmap_dir = os.path.join(get_render_output_dir(), "colmap")
+                result = write_colmap_files(world_points, target_pos, colmap_dir, render_cam, doc, target_obj)
+                export_status.append("✓ Synthetic COLMAP data: {} points in {}".format(result["points"], result["dir"]))
+            except Exception as e:
+                export_status.append("✗ Synthetic COLMAP data export failed: {}".format(e))
+        
+        if EXPORT_CAMERA_POSES_JSON:
+            try:
+                pose_path = os.path.join(get_render_output_dir(), "camera_poses.json")
+                write_pose_json(world_points, target_pos, pose_path, render_cam)
+                export_status.append("✓ Pose JSON: {}".format(pose_path))
+            except Exception as e:
+                export_status.append("✗ Pose JSON export failed: {}".format(e))
+        
+        msg = "Camera rig ready! {} cameras created.\n\n".format(len(world_points))
+        msg += "\n".join(export_status)
+        msg += "\n\nNext: Render animation to produce image sequence.\n"
+        msg += "Then import the synthetic COLMAP data folder into your reconstruction pipeline."
+        
+        c4d.gui.MessageDialog(msg)
+    
+    finally:
+        doc.EndUndo()
+
+
+if __name__ == "__main__":
+    main()
