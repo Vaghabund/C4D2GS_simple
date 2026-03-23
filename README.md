@@ -15,7 +15,7 @@ Running the script produces:
 1. Open Cinema 4D and select your target object.
 2. Open [c4d2gs_simple](c4d2gs_simple) in Cinema 4D Script Manager.
 3. Set your output path and basic capture settings near the top of the script.
-4. Run the script to build the rig and export synthetic COLMAP data.
+4. Run the script to build the rig and export synthetic COLMAP data. Make sure your target object is selected in the object-manager; the generated cameras are always aimed at the selected object’s center axis.
 5. Render the animation to output your frame sequence.
 6. Import the synthetic COLMAP data and rendered images into your reconstruction/training app.
 
@@ -23,11 +23,11 @@ Running the script produces:
 
 Typical output folder structure:
 
-- `colmap/cameras.txt`
-- `colmap/images.txt`
-- `colmap/points3D.txt`
+- `cameras.txt`
+- `images.txt`
+- `points3D.txt`
 - `camera_poses.json` (optional)
-- `gs_0000.png`, `gs_0001.png`, ...
+- `images/gs_0000.png`, `images/gs_0001.png`, ...
 
 ## Note About the Full Plugin
 

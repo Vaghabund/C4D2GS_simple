@@ -24,6 +24,9 @@ import os
 import random
 import bisect
 
+doc: c4d.documents.BaseDocument  # The currently active document.
+op: c4d.BaseObject | None  # The primary selected object in `doc`. Can be `None`.
+
 # ===========================================================================
 # SETTINGS — Edit these values before running
 # ===========================================================================
@@ -33,17 +36,19 @@ CAMERA_COUNT = 120              # Number of viewpoints around the object
 SPHERE_RADIUS = 300.0           # Distance from object center to each camera
 
 # Render output
-OUTPUT_PATH = r"C:\temp\gs_capture\gs_####"  # #### gets replaced by frame number
-RESOLUTION_X = 1920
+# Must be set before execution. Example: r"C:\renders\my_capture"
+OUTPUT_PATH = r"" 
+RESOLUTION_X = 1080
 RESOLUTION_Y = 1080
 FPS = 30
+ENABLE_STRAIGHT_ALPHA = True       # If True, attempt to render with straight alpha channel.
 
 # Exports
-EXPORT_CAMERA_POSES_JSON = True       # Exports camera_poses.json (for nerfstudio)
+EXPORT_CAMERA_POSES_JSON = False       # Exports camera_poses.json (for nerfstudio)
 EXPORT_COLMAP_DATA = True             # Exports synthetic COLMAP data files
 
 # Sparse point cloud
-SPARSE_POINT_COUNT = 256        # Number of 3D points sampled from object surface
+SPARSE_POINT_COUNT = 20000    # Number of 3D points sampled from object surface
 REPLACE_EXISTING_RIG = True     # Remove old GS_CameraRig before building new one
 
 # ===========================================================================
@@ -56,6 +61,29 @@ def normalize_vec(v):
     if length <= 0.0:
         return c4d.Vector(0, 1, 0)
     return c4d.Vector(v.x / length, v.y / length, v.z / length)
+
+
+def _normalize(v):
+    return normalize_vec(v)
+
+
+def dot(a, b):
+    """Dot product of two vectors."""
+    return a.x * b.x + a.y * b.y + a.z * b.z
+
+
+def _dot(a, b):
+    return dot(a, b)
+
+
+def _clean_small(value, eps=1e-10):
+    try:
+        v = float(value)
+    except Exception:
+        return value
+    if abs(v) < float(eps):
+        return 0.0
+    return v
 
 
 def cross(a, b):
@@ -113,7 +141,8 @@ def get_object_center(obj):
     """Get world-space center of an object."""
     if obj is None:
         return c4d.Vector(0)
-    return obj.GetMg().off + obj.GetMp()
+    # Convert local bounding-box center into world space.
+    return obj.GetMp() * obj.GetMg()
 
 
 def matrix_to_rows(mg):
@@ -145,38 +174,72 @@ def rotation_matrix_to_quaternion(r):
 
 def c2w_to_colmap_extrinsics(mg):
     """Convert C4D camera-to-world matrix to COLMAP extrinsics (quat, translation, rotation)."""
-    c = mg.off
-    xw = mg.v1
-    yw = mg.v2
-    zw = mg.v3
-    
-    # C4D: +X right, +Y up, +Z back
-    # COLMAP: +X right, +Y down, +Z forward
-    # Apply S = diag(1, -1, -1) to camera rows
+    flip_y = c4d.Matrix()
+    flip_y.v1 = c4d.Vector(1, 0, 0)
+    flip_y.v2 = c4d.Vector(0, -1, 0)
+    flip_y.v3 = c4d.Vector(0, 0, 1)
+    flip_y.off = c4d.Vector(0, 0, 0)
+
+    mg1 = mg * flip_y
+
+    def _apply_flip_y(mat):
+        out = c4d.Matrix()
+        out.v1 = c4d.Vector(mat.v1.x, -mat.v1.y, mat.v1.z)
+        out.v2 = c4d.Vector(mat.v2.x, -mat.v2.y, mat.v2.z)
+        out.v3 = c4d.Vector(mat.v3.x, -mat.v3.y, mat.v3.z)
+        out.off = c4d.Vector(mat.off.x, -mat.off.y, mat.off.z)
+        return out
+
+    mg2 = _apply_flip_y(mg1)
+
+    c_pos = mg2.off
     r_w2c = [
-        [ xw.x,  xw.y,  xw.z],
-        [-yw.x, -yw.y, -yw.z],
-        [-zw.x, -zw.y, -zw.z],
+        [mg2.v1.x, mg2.v1.y, mg2.v1.z],
+        [mg2.v2.x, mg2.v2.y, mg2.v2.z],
+        [mg2.v3.x, mg2.v3.y, mg2.v3.z],
     ]
-    
+    tx = -(r_w2c[0][0] * c_pos.x + r_w2c[0][1] * c_pos.y + r_w2c[0][2] * c_pos.z)
+    ty = -(r_w2c[1][0] * c_pos.x + r_w2c[1][1] * c_pos.y + r_w2c[1][2] * c_pos.z)
+    tz = -(r_w2c[2][0] * c_pos.x + r_w2c[2][1] * c_pos.y + r_w2c[2][2] * c_pos.z)
     qw, qx, qy, qz = rotation_matrix_to_quaternion(r_w2c)
-    tx = -(r_w2c[0][0] * c.x + r_w2c[0][1] * c.y + r_w2c[0][2] * c.z)
-    ty = -(r_w2c[1][0] * c.x + r_w2c[1][1] * c.y + r_w2c[1][2] * c.z)
-    tz = -(r_w2c[2][0] * c.x + r_w2c[2][1] * c.y + r_w2c[2][2] * c.z)
-    
+
     return (qw, qx, qy, qz), (tx, ty, tz), r_w2c
 
 
-def project_to_image(mg, world_point, fx, fy, cx, cy):
-    """Project a world point into image space using camera matrix."""
-    local = (~mg) * world_point
-    if local.z >= -1e-6:
+def project_world_to_image(mg, world_point, world_normal, fx, fy, cx, cy, require_front_facing=True):
+    """Project world point to image coordinates with COLMAP conventions."""
+    flip_y = c4d.Matrix(); flip_y.v1 = c4d.Vector(1,0,0); flip_y.v2 = c4d.Vector(0,-1,0); flip_y.v3 = c4d.Vector(0,0,1); flip_y.off = c4d.Vector(0,0,0)
+
+    def _apply_flip_y_vec(v):
+        return c4d.Vector(v.x, -v.y, v.z)
+
+    def _apply_flip_y_mat(mat):
+        out = c4d.Matrix()
+        out.v1 = c4d.Vector(mat.v1.x, -mat.v1.y, mat.v1.z)
+        out.v2 = c4d.Vector(mat.v2.x, -mat.v2.y, mat.v2.z)
+        out.v3 = c4d.Vector(mat.v3.x, -mat.v3.y, mat.v3.z)
+        out.off = c4d.Vector(mat.off.x, -mat.off.y, mat.off.z)
+        return out
+
+    mg1 = mg * flip_y
+    mg2 = _apply_flip_y_mat(mg1)
+
+    p_col = _apply_flip_y_vec(world_point)
+    if world_normal is not None:
+        n_col = _apply_flip_y_vec(world_normal)
+        if require_front_facing:
+            to_cam_col = _normalize(mg2.off - p_col)
+            if _dot(to_cam_col, n_col) <= 0.0:
+                return None
+
+    local = (~mg2) * p_col
+    x_cv = local.x
+    y_cv = local.y
+    z_cv = local.z
+    if z_cv <= 1e-6:
         return None
-    
-    depth = -local.z
-    u = (fx * (local.x / depth)) + cx
-    v = (fy * (-local.y / depth)) + cy
-    return u, v
+
+    return (fx * (x_cv / z_cv)) + cx, (fy * (y_cv / z_cv)) + cy
 
 
 def collect_triangles_from_object(obj):
@@ -227,17 +290,17 @@ def sample_on_triangle(a, b, c):
     return a * (1.0 - r1) + b * (r1 * (1.0 - r2)) + c * (r1 * r2)
 
 
-def generate_sparse_points_from_surface(obj, count=256):
-    """Generate sparse points by area-weighted sampling from object surface."""
+def generate_sparse_points_from_surface(doc, obj, count=256):
+    """Generate sparse points by area-weighted sampling from object surface (with normals)."""
     triangles = collect_triangles_from_object(obj)
     if not triangles:
         return None
-    
+
     # Build area-weighted distribution
     areas = []
     cumulative = []
     running = 0.0
-    
+
     for tri in triangles:
         ar = triangle_area(tri[0], tri[1], tri[2])
         if ar <= 1e-12:
@@ -245,20 +308,50 @@ def generate_sparse_points_from_surface(obj, count=256):
         areas.append((tri, ar))
         running += ar
         cumulative.append(running)
-    
+
     if running <= 0.0 or not areas:
         return None
-    
-    # Sample points
+
+    # Sample points and normals
     out = []
     for _ in range(count):
         r = random.random() * running
         idx = bisect.bisect_left(cumulative, r)
         if idx >= len(areas):
             idx = len(areas) - 1
-        tri = areas[idx][0]
-        out.append(sample_on_triangle(tri[0], tri[1], tri[2]))
-    
+        a, b, c = areas[idx][0]
+        p = sample_on_triangle(a, b, c)
+        n = normalize_vec(cross(b - a, c - a))
+        out.append((p, n))
+
+    return out
+
+
+def generate_sparse_points_in_core_volume(target_obj, target_pos, count=256, radius_factor=0.35):
+    """Fallback sparse points sampled inside a core sphere of the target bounds."""
+    if target_obj is None:
+        return None
+    count = max(8, int(count))
+    try:
+        rad = target_obj.GetRad()
+        diag = math.sqrt(rad.x ** 2 + rad.y ** 2 + rad.z ** 2)
+        base_radius = max(diag * 2.5, 10.0)
+    except Exception:
+        base_radius = 300.0
+
+    core_radius = max(1.0, base_radius * max(0.05, float(radius_factor)))
+    out = []
+    for _ in range(count):
+        u = random.random()
+        v = random.random()
+        w = random.random()
+        theta = 2.0 * math.pi * u
+        phi = math.acos(max(-1.0, min(1.0, 2.0 * v - 1.0)))
+        r = core_radius * (w ** (1.0 / 3.0))
+        sx = r * math.sin(phi) * math.cos(theta)
+        sy = r * math.cos(phi)
+        sz = r * math.sin(phi) * math.sin(theta)
+        out.append((target_pos + c4d.Vector(sx, sy, sz), None))
     return out
 
 
@@ -270,19 +363,62 @@ def get_output_extension():
 def build_frame_image_path(frame_index):
     """Build output path for a single frame."""
     token = "{:04d}".format(frame_index)
-    base = OUTPUT_PATH.replace("####", token) if "####" in OUTPUT_PATH else "{}_{}".format(OUTPUT_PATH, token)
+    base = os.path.join(get_images_output_dir(), "gs_{}".format(token))
     ext = get_output_extension()
     return base if base.lower().endswith(ext.lower()) else base + ext
 
 
 def get_render_output_dir():
-    """Get base render output directory."""
+    """Get export root output directory."""
     path = str(OUTPUT_PATH).strip()
     if not path:
-        return os.path.expanduser("~/Documents/gs_capture")
-    if os.path.isdir(path):
-        return path
-    return os.path.dirname(path)
+        return ""
+    return os.path.abspath(os.path.expandvars(os.path.expanduser(path)))
+
+
+def get_images_output_dir():
+    """Get image sequence output directory under export root."""
+    return os.path.join(get_render_output_dir(), "images")
+
+
+def get_render_output_pattern():
+    """Get C4D render output pattern for frame sequence."""
+    return os.path.join(get_images_output_dir(), "gs_####")
+
+
+def _copy_matrix(mg):
+    out = c4d.Matrix()
+    out.off = c4d.Vector(mg.off.x, mg.off.y, mg.off.z)
+    out.v1 = c4d.Vector(mg.v1.x, mg.v1.y, mg.v1.z)
+    out.v2 = c4d.Vector(mg.v2.x, mg.v2.y, mg.v2.z)
+    out.v3 = c4d.Vector(mg.v3.x, mg.v3.y, mg.v3.z)
+    return out
+
+
+def _camera_matrices_for_export(doc, render_cam, frame_count, fps):
+    if doc is None or render_cam is None or frame_count <= 0:
+        return None
+
+    current_time = doc.GetTime()
+    out = []
+    try:
+        for frame in range(frame_count):
+            doc.SetTime(c4d.BaseTime(frame, fps))
+            try:
+                doc.ExecutePasses(None, True, True, True, getattr(c4d, "BUILDFLAGS_NONE", 0))
+            except Exception:
+                pass
+            out.append(_copy_matrix(render_cam.GetMg()))
+    finally:
+        doc.SetTime(current_time)
+        try:
+            doc.ExecutePasses(None, True, True, True, getattr(c4d, "BUILDFLAGS_NONE", 0))
+        except Exception:
+            pass
+
+    if len(out) != frame_count:
+        return None
+    return out
 
 
 def get_colmap_intrinsics(render_cam):
@@ -314,108 +450,136 @@ def get_colmap_intrinsics(render_cam):
     }
 
 
-def write_colmap_files(world_points, target_pos, output_dir, render_cam, doc, target_obj):
+def write_colmap_files(world_points, target_pos, output_dir, render_cam, doc, target_obj, camera_matrices=None):
     """Export synthetic COLMAP data files (cameras.txt, images.txt, points3D.txt)."""
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-    
+    images_dir = os.path.join(output_dir, "images")
+    if not os.path.exists(images_dir):
+        os.makedirs(images_dir)
+
     cameras_txt = os.path.join(output_dir, "cameras.txt")
     images_txt = os.path.join(output_dir, "images.txt")
     points3d_txt = os.path.join(output_dir, "points3D.txt")
-    
+
     intrinsics = get_colmap_intrinsics(render_cam)
     fx = float(intrinsics["fx"])
     fy = float(intrinsics["fy"])
     cx = float(intrinsics["cx"])
     cy = float(intrinsics["cy"])
-    
-    # Write cameras.txt
+    width = float(RESOLUTION_X)
+    height = float(RESOLUTION_Y)
+
+    if doc is None or target_obj is None:
+        raise ValueError("A target object is required for synthetic COLMAP data export.")
+
+    sparse_points_with_normals = generate_sparse_points_from_surface(doc, target_obj, SPARSE_POINT_COUNT)
+    if not sparse_points_with_normals:
+        raise ValueError("Could not sample sparse points from object surface. Ensure object has polygonal geometry.")
+
+    if camera_matrices is None:
+        camera_matrices = _camera_matrices_for_export(doc, render_cam, len(world_points), FPS)
+
+    def _build_image_entries(use_camera_matrices):
+        entries = []
+        for i, world_pos in enumerate(world_points):
+            if use_camera_matrices and camera_matrices and i < len(camera_matrices):
+                mg = camera_matrices[i]
+            else:
+                mg = look_at_matrix(world_pos, target_pos)
+            q, t, r_w2c = c2w_to_colmap_extrinsics(mg)
+            entries.append({
+                "image_id": i + 1,
+                "name": os.path.basename(build_frame_image_path(i)),
+                "q": q,
+                "t": t,
+                "r_w2c": r_w2c,
+                "mg": mg,
+                "obs": [],
+            })
+        return entries
+
+    image_entries = _build_image_entries(use_camera_matrices=True)
+    image_entries = sorted(image_entries, key=lambda e: e["name"])
+    for idx, entry in enumerate(image_entries, start=1):
+        entry["image_id"] = idx
+
+    max_obs = max(2, int(12))
+
+    def _build_tracks(require_front_facing):
+        tracks = {}
+        for entry in image_entries:
+            entry["obs"] = []
+        for pid, (p3d, nrm) in enumerate(sparse_points_with_normals, start=1):
+            tracks[pid] = []
+            candidates = []
+            for entry in image_entries:
+                projected = project_world_to_image(entry["mg"], p3d, nrm, fx, fy, cx, cy, require_front_facing=require_front_facing)
+                if projected is None:
+                    continue
+                u, v = projected
+                if 0.0 <= u < width and 0.0 <= v < height:
+                    candidates.append((entry, u, v))
+            for entry, u, v in candidates[:max_obs]:
+                p2d_idx = len(entry["obs"])
+                entry["obs"].append((u, v, pid))
+                tracks[pid].append((entry["image_id"], p2d_idx))
+        return tracks
+
+    tracks_by_pid = _build_tracks(require_front_facing=True)
+    valid_points = [(pid, p3d, tracks_by_pid[pid]) for pid, (p3d, _nrm) in enumerate(sparse_points_with_normals, start=1) if len(tracks_by_pid.get(pid, [])) >= 1]
+
+    if not valid_points:
+        tracks_by_pid = _build_tracks(require_front_facing=False)
+        valid_points = [(pid, p3d, tracks_by_pid[pid]) for pid, (p3d, _nrm) in enumerate(sparse_points_with_normals, start=1) if len(tracks_by_pid.get(pid, [])) >= 1]
+
+    if not valid_points:
+        core_points = generate_sparse_points_in_core_volume(target_obj, target_pos, SPARSE_POINT_COUNT, 0.35)
+        if core_points:
+            sparse_points_with_normals = core_points
+            tracks_by_pid = _build_tracks(require_front_facing=False)
+            valid_points = [(pid, p3d, tracks_by_pid[pid]) for pid, (p3d, _nrm) in enumerate(sparse_points_with_normals, start=1) if len(tracks_by_pid.get(pid, [])) >= 1]
+
+    if not valid_points:
+        raise ValueError("No sparse point had >= 1 observation after visibility checks.")
+
     with open(cameras_txt, "w") as f:
         f.write("# Camera list\n")
         f.write("# CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
         f.write("# Number of cameras: 1\n")
-        f.write("1 PINHOLE {} {} {} {} {} {}\n".format(
-            int(RESOLUTION_X), int(RESOLUTION_Y), fx, fy, cx, cy
-        ))
-    
-    # Generate sparse points from surface
-    sparse_points = generate_sparse_points_from_surface(target_obj, SPARSE_POINT_COUNT)
-    if not sparse_points:
-        raise ValueError("Could not sample sparse points from object surface. Ensure object has polygon geometry.")
-    
-    # Build image entries and track observations
-    image_entries = []
-    for i, world_pos in enumerate(world_points):
-        mg = look_at_matrix(world_pos, target_pos)
-        q, t, r_w2c = c2w_to_colmap_extrinsics(mg)
-        
-        image_entries.append({
-            "image_id": i + 1,
-            "name": os.path.basename(build_frame_image_path(i)),
-            "q": q,
-            "t": t,
-            "r_w2c": r_w2c,
-            "mg": mg,
-            "obs": [],
-        })
-    
-    tracks_by_pid = {}
-    for pid, p3d in enumerate(sparse_points, start=1):
-        tracks_by_pid[pid] = []
-        for entry in image_entries:
-            proj = project_to_image(entry["mg"], p3d, fx, fy, cx, cy)
-            if proj is None:
-                continue
-            u, v = proj
-            if 0 <= u < RESOLUTION_X and 0 <= v < RESOLUTION_Y:
-                pt_idx = len(entry["obs"])
-                entry["obs"].append((u, v, pid))
-                tracks_by_pid[pid].append((entry["image_id"], pt_idx))
-    
-    # Write images.txt
+        if abs(float(fx) - float(fy)) < 1e-6:
+            f.write("1 SIMPLE_PINHOLE {} {} {} {} {}\n".format(int(RESOLUTION_X), int(RESOLUTION_Y), fx, cx, cy))
+        else:
+            f.write("1 PINHOLE {} {} {} {} {} {}\n".format(int(RESOLUTION_X), int(RESOLUTION_Y), fx, fy, cx, cy))
+
     with open(images_txt, "w") as f:
         f.write("# Image list\n")
         f.write("# IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
         f.write("# POINTS2D[] as (X, Y, POINT3D_ID)\n")
-        f.write("# Number of images: {}\n".format(len(world_points)))
-        
+        f.write("# Number of images: {}\n".format(len(image_entries)))
         for entry in image_entries:
-            f.write("{} {} {} {} {} {} {} {} 1 {}\n".format(
-                entry["image_id"],
-                entry["q"][0], entry["q"][1], entry["q"][2], entry["q"][3],
-                entry["t"][0], entry["t"][1], entry["t"][2],
-                entry["name"],
-            ))
+            qw, qx, qy, qz = entry["q"]
+            tx, ty, tz = entry["t"]
+            f.write("{} {} {} {} {} {} {} {} 1 {}\n".format(entry["image_id"], _clean_small(qw), _clean_small(qx), _clean_small(qy), _clean_small(qz), _clean_small(tx), _clean_small(ty), _clean_small(tz), entry["name"]))
             if entry["obs"]:
                 f.write(" ".join("{} {} {}".format(o[0], o[1], o[2]) for o in entry["obs"]) + "\n")
             else:
                 f.write("\n")
-    
-    # Filter to valid points (at least 1 observation)
-    valid_points = []
-    for pid, p3d in enumerate(sparse_points, start=1):
-        track = tracks_by_pid.get(pid, [])
-        if len(track) >= 1:
-            valid_points.append((pid, p3d, track))
-    
-    if not valid_points:
-        raise ValueError("No sparse points with observations. Try more cameras or more sparse points.")
-    
-    # Write points3D.txt
+
     with open(points3d_txt, "w") as f:
         f.write("# 3D point list\n")
         f.write("# POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[]\n")
         f.write("# Number of points: {}\n".format(len(valid_points)))
-        
         for pid, p3d, track in valid_points:
             track_flat = " ".join("{} {}".format(img_id, p2d_idx) for img_id, p2d_idx in track)
-            f.write("{} {} {} {} 255 255 255 1.0 {}\n".format(
-                pid, p3d.x, p3d.y, -p3d.z, track_flat
-            ))
-    
+            colmap_x = p3d.x
+            colmap_y = -p3d.y
+            colmap_z = p3d.z
+            f.write("{} {} {} {} 255 255 255 1.0 {}\n".format(pid, colmap_x, colmap_y, colmap_z, track_flat))
+
     return {
         "dir": output_dir,
-        "intrinsics_source": intrinsics["source"],
+        "intrinsics_source": intrinsics.get("source", "manual"),
         "points": len(valid_points),
     }
 
@@ -524,13 +688,30 @@ def add_position_key(cam, time, pos, fps):
 # MAIN FUNCTION
 # ===========================================================================
 
-def main():
-    doc = c4d.documents.GetActiveDocument()
-    if not doc:
+def main() -> None:
+    if doc is None:
         c4d.gui.MessageDialog("No active Cinema 4D document.")
         return
-    
-    target_obj = doc.GetActiveObject()
+
+    if not str(OUTPUT_PATH).strip():
+        c4d.gui.MessageDialog(
+            "Output Path is empty.\n\n"
+            "Set OUTPUT_PATH in the script settings before execution.\n"
+            "Example: r\"C:\\renders\\my_capture\""
+        )
+        return
+
+    output_dir = get_render_output_dir()
+    images_dir = get_images_output_dir()
+    try:
+        if not os.path.exists(images_dir):
+            os.makedirs(images_dir)
+    except Exception as e:
+        c4d.gui.MessageDialog("Could not create export folders:\n{}".format(e))
+        return
+
+    # Prefer Script Manager's primary selection (`op`) when available.
+    target_obj = op if op is not None else doc.GetActiveObject()
     if not target_obj:
         c4d.gui.MessageDialog("Select an object in the Object Manager.")
         return
@@ -595,15 +776,39 @@ def main():
             rd[c4d.RDATA_YRES] = RESOLUTION_Y
             rd[c4d.RDATA_FRAMERATE] = FPS
             rd[c4d.RDATA_SAVEIMAGE] = True
-            rd[c4d.RDATA_PATH] = OUTPUT_PATH
+            rd[c4d.RDATA_PATH] = get_render_output_pattern()
             rd[c4d.RDATA_FORMAT] = c4d.FILTER_PNG
             rd[c4d.RDATA_FRAMESEQUENCE] = c4d.RDATA_FRAMESEQUENCE_ALLFRAMES
             rd[c4d.RDATA_FRAMEFROM] = c4d.BaseTime(0, FPS)
             rd[c4d.RDATA_FRAMETO] = c4d.BaseTime(len(world_points) - 1, FPS)
-            
+
+            if ENABLE_STRAIGHT_ALPHA:
+                for attr_name in [
+                    "RDATA_ALPHACHANNEL",
+                    "RDATA_ALPHA",
+                    "RDATA_STRAIGHT_ALPHA",
+                    "RDATA_STRAIGHTALPHA",
+                ]:
+                    attr = getattr(c4d, attr_name, None)
+                    if attr is not None:
+                        rd[attr] = True
+
             if hasattr(c4d, "RDATA_CAMERA"):
                 rd[c4d.RDATA_CAMERA] = render_cam
-        
+
+        # Select the created render camera and make it active for rendering.
+        try:
+            doc.SetActiveObject(render_cam, c4d.SELECTION_NEW)
+        except Exception:
+            pass
+
+        bd = doc.GetActiveBaseDraw()
+        if bd is not None and render_cam is not None:
+            try:
+                bd.SetSceneCamera(render_cam)
+            except Exception:
+                pass
+
         doc.SetTime(c4d.BaseTime(0, FPS))
         c4d.EventAdd()
         
@@ -612,15 +817,17 @@ def main():
         
         if EXPORT_COLMAP_DATA:
             try:
-                colmap_dir = os.path.join(get_render_output_dir(), "colmap")
-                result = write_colmap_files(world_points, target_pos, colmap_dir, render_cam, doc, target_obj)
+                # Store COLMAP files at the export root
+                colmap_dir = output_dir
+                cam_matrices = _camera_matrices_for_export(doc, render_cam, len(world_points), FPS)
+                result = write_colmap_files(world_points, target_pos, colmap_dir, render_cam, doc, target_obj, camera_matrices=cam_matrices)
                 export_status.append("✓ Synthetic COLMAP data: {} points in {}".format(result["points"], result["dir"]))
             except Exception as e:
                 export_status.append("✗ Synthetic COLMAP data export failed: {}".format(e))
         
         if EXPORT_CAMERA_POSES_JSON:
             try:
-                pose_path = os.path.join(get_render_output_dir(), "camera_poses.json")
+                pose_path = os.path.join(output_dir, "camera_poses.json")
                 write_pose_json(world_points, target_pos, pose_path, render_cam)
                 export_status.append("✓ Pose JSON: {}".format(pose_path))
             except Exception as e:
