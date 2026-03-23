@@ -1,4 +1,4 @@
-# C4D2GS Script Workflow
+# c4d2gs_lite Script Workflow
 
 This repository includes a fast Cinema 4D script workflow to generate synthetic COLMAP data for Gaussian Splatting pipelines.
 
@@ -13,7 +13,7 @@ Running the script produces:
 ## Quick Usage
 
 1. Open Cinema 4D and select your target object.
-2. Open [c4d2gs_simple](c4d2gs_simple) in Cinema 4D Script Manager.
+2. Open [c4d2gs_lite.py](c4d2gs_lite.py) in Cinema 4D Script Manager.
 3. Set your output path and basic capture settings near the top of the script.
 4. Run the script to build the rig and export synthetic COLMAP data. Make sure your target object is selected in the object-manager; the generated cameras are always aimed at the selected object’s center axis.
 5. Render the animation to output your frame sequence.
