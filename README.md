@@ -31,4 +31,4 @@ Typical output folder structure:
 
 ## Note About the Full Plugin
 
-If you want a cleaner UI, richer controls, and a more guided production workflow, use the full C4D2GS plugin in [c4d2gs](c4d2gs). It is the easiest way to generate synthetic COLMAP data at scale with fewer manual steps.
+If you want a cleaner UI, richer controls, and a more guided production workflow, use the full C4D2GS plugin in [http://Vaghabund.gumroad.com/l/c4d2gs](c4d2gs). It is the easiest way to generate synthetic COLMAP data at scale with fewer manual steps.
